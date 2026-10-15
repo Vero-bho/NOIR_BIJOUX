@@ -1,42 +1,147 @@
-# Полный запуск Noir Bijoux в Docker.
-# База данных остаётся облачной: PostgreSQL в Supabase.
-# Строка DATABASE_URL передаётся только контейнеру backend из backend/.env.
-# Запуск из корня проекта: docker compose up --build -d
+name: build
 
-services:
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file:
-      - ./backend/.env
-    environment:
-      NODE_ENV: production
-      PORT: "4000"
-      UPLOAD_DIR: uploads
-    ports:
-      - "4000:4000"
-    volumes:
-      - noir-bijoux-uploads:/app/uploads
-    restart: unless-stopped
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        # Адрес API для браузера. Для локального запуска он доступен на хосте.
-        # Для размещения в интернете укажите публичный HTTPS URL API.
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:4000/api}
-    environment:
-      NODE_ENV: production
-      HOST: 0.0.0.0
-      PORT: "3000"
-    ports:
-      - "5173:3000"
-    depends_on:
-      - backend
-    restart: unless-stopped
+permissions:
+  contents: read
 
-volumes:
-  noir-bijoux-uploads:
+jobs:
+  test:
+    name: Test backend and frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out monorepo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js for backend
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: backend
+        run: npm run prisma:generate
+
+      - name: Type-check backend
+        working-directory: backend
+        run: npm run typecheck
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test
+
+      - name: Set up Node.js for frontend
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Check frontend structure and types
+        working-directory: frontend
+        run: |
+          npm run check:files
+          npm run typecheck
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  build-backend:
+    name: Build and publish backend image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out monorepo
+        uses: actions/checkout@v4
+
+      - name: Normalize GHCR owner
+        id: ghcr
+        shell: bash
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/noir-bijoux-backend:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/noir-bijoux-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-frontend:
+    name: Build and publish frontend image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out monorepo
+        uses: actions/checkout@v4
+
+      - name: Normalize GHCR owner
+        id: ghcr
+        shell: bash
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            VITE_API_URL=${{ vars.VITE_API_URL || '/api' }}
+          tags: |
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/noir-bijoux-frontend:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/noir-bijoux-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
